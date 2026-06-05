@@ -1,0 +1,95 @@
+registry:
+  name: northstar-models
+  backend: mlflow  # self-hosted MLflow Tracking Server on K8s
+
+  stages:
+    - name: staging
+      promoted_from: >
+        A completed training run whose eval_report.json is attached to the MLflow
+        run. Promotion is triggered automatically by the CI training job after
+        evaluation passes all auto-gates below.
+      promotion_rule: automatic
+      gates:
+        - metric: mae_minutes
+          condition: "≤ 3.5"
+          dataset: frozen_eval_set_v7  # never retrained on; hash pinned in DVC
+          description: >
+            Mean Absolute Error on the frozen hold-out set must not exceed
+            3.5 minutes. Compared against the current production model;
+            new model must match or beat it.
+        - metric: p95_inference_latency_ms
+          condition: "≤ 150"
+          description: >
+            95th-percentile latency measured in the staging K8s namespace
+            under a 200-RPS load test (10-minute soak). Must not exceed
+            the ETA model SLA.
+        - metric: unit_tests_pass
+          condition: "== true"
+          description: >
+            All pytest unit tests in tests/ must pass (0 failures).
+            Includes schema validation, null-check, and output-range assertions.
+
+    - name: production
+      promoted_from: staging
+      promotion_rule: manual
+      gates:
+        - metric: per_city_mae_minutes
+          condition: "≤ 5.0 for every city in the bottom-3 by volume"
+          description: >
+            The three cities with the lowest delivery volume in the past
+            30 days must each individually have MAE ≤ 5.0 min on the
+            per-city slice of the frozen eval set.  Prevents silent
+            regression on underrepresented markets.
+        - metric: late_delivery_false_negative_rate
+          condition: "≤ 0.08"
+          description: >
+            Rate at which the model predicts on-time but delivery is
+            actually late (>15 min over ETA). Measured on the frozen eval
+            set. Cap at 8% — this slice drives customer complaints.
+        - metric: canary_error_rate_delta
+          condition: "≤ +0.005 vs current production"
+          description: >
+            After 1 hour of 5%-traffic canary, the HTTP 5xx error rate
+            of the new version must not exceed the current production
+            baseline by more than 0.5 percentage points.
+      approvers:
+        - ml_lead          # owns model quality bar
+        - product_owner    # owns customer experience SLA
+
+    - name: archived
+      promoted_from: >
+        Any version that was in production and has been superseded by a newer
+        production promotion. Also triggered manually by ml_lead when a staging
+        model is rejected and will not be retried. Archived models are
+        read-only; weights retained per retention_versions policy.
+
+models:
+  - name: eta
+    owner: ml-team          # team alias → pagerduty rotation
+    task: regression
+    inference_mode: online
+    target_rps: 200
+    sla_p95_ms: 150
+    retraining_cadence: every_2_weeks
+    retention_versions: 10
+    eval_set_dvc_ref: "data/eval/eta_frozen_v7.dvc"  # never changes between runs
+
+  - name: dispatcher-routing
+    owner: ml-team
+    task: ranking
+    inference_mode: online
+    target_rps: 50
+    sla_p95_ms: 80
+    retraining_cadence: monthly
+    retention_versions: 10
+    eval_set_dvc_ref: "data/eval/dispatcher_frozen_v3.dvc"
+
+lineage:
+  # Every model version registered in the registry MUST carry these fields.
+  # Missing fields cause the CI promotion step to fail (hard block, not warning).
+  required_fields:
+    - git_sha          # exact commit of training code that produced this run
+    - dataset_hash     # SHA-256 of the DVC-versioned training dataset snapshot
+    - mlflow_run_id    # UUID linking back to all logged params, metrics, artifacts
+    - base_image_sha   # Docker image digest (e.g. sha256:7f3a…) used for training
+    - eval_set_ref     # DVC ref of the frozen hold-out set used for gated metrics
